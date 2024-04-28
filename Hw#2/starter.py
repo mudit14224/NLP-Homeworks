@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.autograd import Variable
 from transformers import GPT2TokenizerFast
+from torch.utils.data import DataLoader, Dataset
+from torch.nn.utils.rnn import pad_sequence
 
 def read_corpus(filename,tokenizer):
     seq = []
@@ -247,20 +249,22 @@ class DecoderLayer(nn.Module):
         self.norm_3 = Norm(d_model)
         
         self.dropout_1 = nn.Dropout(dropout)
-        self.dropout_2 = nn.Dropout(dropout)
+        # self.dropout_2 = nn.Dropout(dropout)
         self.dropout_3 = nn.Dropout(dropout)
         
         self.attn_1 = MultiHeadAttention(heads, d_model, dropout=dropout)
-        self.attn_2 = MultiHeadAttention(heads, d_model, dropout=dropout)
+        # self.attn_2 = MultiHeadAttention(heads, d_model, dropout=dropout)
         self.ff = FeedForward(d_model, dropout=dropout)
 
-    def forward(self, x, e_outputs, src_mask, trg_mask):
+    def forward(self, x, trg_mask):
         x2 = self.norm_1(x)
         x = x + self.dropout_1(self.attn_1(x2, x2, x2, trg_mask))
         x2 = self.norm_2(x)
-        x = x + self.dropout_2(self.attn_2(x2, e_outputs, e_outputs, \
-        src_mask))
-        x2 = self.norm_3(x)
+        # Cross Attention
+        # x = x + self.dropout_2(self.attn_2(x2, e_outputs, e_outputs, \
+        # src_mask))
+        # x2 = self.norm_3(x)
+        #######
         x = x + self.dropout_3(self.ff(x2))
         return x    
     
@@ -283,36 +287,39 @@ class Decoder(nn.Module):
     def __init__(self, vocab_size, d_model, N, heads, dropout):
         super().__init__()
         self.N = N
-        self.embed = Embedder(vocab_size, d_model)x
+        self.embed = Embedder(vocab_size, d_model)
         self.pe = PositionalEncoder(d_model, dropout=dropout)
         self.layers = get_clones(DecoderLayer(d_model, heads, dropout), N)
         self.norm = Norm(d_model)
-    def forward(self, trg, e_outputs, src_mask, trg_mask):
+    def forward(self, trg, trg_mask):
         x = self.embed(trg)
         x = self.pe(x)
         for i in range(self.N):
-            x = self.layers[i](x, e_outputs, src_mask, trg_mask)
+            x = self.layers[i](x, trg_mask)
         return self.norm(x)
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab, trg_vocab, d_model, N, heads, dropout):
+    # Need to combine the source and the target vocab
+    def __init__(self, trg_vocab, d_model, N, heads, dropout):
         super().__init__()
-        self.encoder = Encoder(src_vocab, d_model, N, heads, dropout)
+        # remove the encoder
+        # self.encoder = Encoder(src_vocab, d_model, N, heads, dropout)
         self.decoder = Decoder(trg_vocab, d_model, N, heads, dropout)
         self.out = nn.Linear(d_model, trg_vocab)
-    def forward(self, src, trg, src_mask, trg_mask):
-        e_outputs = self.encoder(src, src_mask)
+    def forward(self, trg, trg_mask):
+        # e_outputs = self.encoder(src, src_mask)
         #print("DECODER")
-        d_output = self.decoder(trg, e_outputs, src_mask, trg_mask)
+        d_output = self.decoder(trg, trg_mask)
         output = self.out(d_output)
         return output
 
-def get_model(opt, src_vocab, trg_vocab):
+def get_model(opt, trg_vocab):
     
     assert opt.d_model % opt.heads == 0
     assert opt.dropout < 1
 
-    model = Transformer(src_vocab, trg_vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout)
+    # Modified the model parameters
+    model = Transformer(trg_vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout)
     model.to(opt.device)
        
     if opt.loadname is not None:
@@ -324,12 +331,72 @@ def get_model(opt, src_vocab, trg_vocab):
                 nn.init.xavier_uniform_(p) 
     
     return model
+
+####### Code for Assignment 
+# Creating a dataset class
+class WikiDataset(Dataset):
+    def __init__(self, data, block_size):
+        super(WikiDataset, self).__init__()
+        self.block_size = block_size
+        self.data = [data[i:i+block_size] for i in range(0, len(data), block_size)]
+
+    def __len__(self):
+        return len(self.data)
     
-def train_model(model, opt):
+    def __getitem__(self, index):
+        text = torch.tensor(self.data[index], dtype=torch.long)
+        # All the text except the last token
+        input_text = text[:-1]
+        # All the text except the first token
+        target_text = text[1:]
+        return input_text, target_text
+    
+# Code for batching along with the padding    
+def collate_fn(batch):
+    input_text, target_text = zip(*batch)
+    inputs = pad_sequence(input_text, batch_first=True, padding_value=0)
+    # Padding value is set to be -100 so that the pad tokens are not considered 
+    # in the gradient calculation 
+    targets = pad_sequence(target_text, batch_first=True, padding_value=-100)
+    return inputs, targets
+
+def no_peak_mask(size):
+    mask = torch.triu(torch.ones(size, size) * float('-inf'), diagonal=1)
+    return mask
+#############################
+
+def validate(model, valid_dataloader, loss_fn, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for input_text, target_text in valid_dataloader:
+            input_text, target_text = input_text.to(device), target_text.to(device)
+            input_mask = no_peak_mask(input_text.size(1)).to(device)
+            output = model(input_text, input_mask)
+            loss = loss_fn(output.view(-1, output.size(-1)), target_text.view(-1))
+            total_loss += loss.item()
+    avg_loss = total_loss / len(valid_dataloader)
+    perplexity = math.exp(avg_loss)
+    return avg_loss, perplexity
+    
+def test(model, test_dataloader, loss_fn, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for input_text, target_text in test_dataloader:
+            input_text, target_text = input_text.to(device), target_text.to(device)
+            input_mask = no_peak_mask(input_text.size(1)).to(device)
+            output = model(input_text, input_mask)
+            loss = loss_fn(output.view(-1, output.size(-1)), target_text.view(-1))
+            total_loss += loss.item()
+    avg_loss = total_loss / len(test_dataloader)
+    perplexity = math.exp(avg_loss)
+    return avg_loss, perplexity
+
+    
+def train_model(model, opt, train_dataloader, valid_dataloader, optimizer, loss_fn, device):
     
     print("training model...")
-    model.train()
-    
     # write code to:
     #  1. create a nopeak mask
     #  2. feed training data to the model in batches
@@ -339,8 +406,46 @@ def train_model(model, opt):
     #  5. calculate and apply the gradients with loss.backward() and optimizer.step()
     #  6. report intermediate trainining perplexity
     #  7. generate a test perplexity once per training epoch by calling test_model()
-    #  8. save model weights to file specified in opt.savename
+    #  8. save model weights to file specified in opt.savenam
     #  SEE trainer.py for examples of each of the above
+
+    # Lists for storing metrics
+    train_losses = []
+    valid_losses = []
+    train_perplexities = []
+    valid_perplexities = []
+
+    for epoch in range(opt.epochs):
+        model.train()
+        total_tl = 0
+
+        for input_text, target_text in train_dataloader:
+            input_text, target_text = input_text.to(device), target_text.to(device)
+            input_mask = no_peak_mask(input_text.size(1)).to(device)
+            output = model(input_text, input_mask)
+            loss = loss_fn(output.view(-1, output.size(-1)), target_text.view(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_tl += loss.item()
+
+        avg_tl = total_tl / len(train_dataloader)
+        train_perplexity = math.exp(avg_tl)
+        avg_vl, valid_perplexity = validate(model, valid_dataloader, loss_fn, device)
+
+        train_losses.append(avg_tl)
+        valid_losses.append(avg_vl)
+        train_perplexities.append(train_perplexity)
+        valid_perplexities.append(valid_perplexity)
+
+        print(f"Epoch {epoch}: Train Loss {avg_tl:.4f}, Train Perplexity {train_perplexity:.4f}")
+        print(f"Epoch {epoch}: Valid Loss {avg_vl:.4f}, Valid Perplexity {valid_perplexity:.4f}")
+
+    return train_losses, train_perplexities, valid_losses, valid_perplexities
+
+
+
     
 def test_model(model, opt, epoch):
     print("testing model...")
@@ -407,7 +512,10 @@ def main():
     opt.indices = torch.tensor(temp)
     opt.indices = opt.indices.cuda()
     
-    model = get_model(opt,opt.vocab_size,opt.vocab_size)
+    # Need a single vocab size
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = get_model(opt,opt.vocab_size)
+    model = model.to(device)
         
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     params = sum([np.prod(p.size()) for p in model_parameters])        
@@ -425,9 +533,29 @@ def main():
             nothing = 1
     opt.src_pad = 0
     opt.trg_pad = 0
+
+
+    # Code goes here
+    # Train Dataloader
+    train_dataset = WikiDataset(opt.train, block_size=opt.seqlen)
+    train_dataloader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=collate_fn)
+
+    # Valid Dataloader
+    valid_dataset = WikiDataset(opt.valid, block_size=opt.seqlen)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=collate_fn)
+
+    # Test Dataloader
+    test_dataset = WikiDataset(opt.test, block_size=opt.seqlen)
+    test_dataloader = DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=collate_fn)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
             
-    train_model(model,opt)
-    test_model(model,opt,-1)
+    train_losses, train_perplexities, \
+        valid_losses, valid_perplexities = train_model(model, opt, train_dataloader, \
+                                                       valid_dataloader, optimizer, loss_fn, device)
+    # test_model(model,opt,-1)
+    avg_loss, perplexity = test(model, test_dataloader, loss_fn, device)
         
 if __name__ == "__main__":
     main()        
