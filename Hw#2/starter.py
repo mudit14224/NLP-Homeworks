@@ -16,6 +16,7 @@ from torch.autograd import Variable
 from transformers import GPT2TokenizerFast
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
+import matplotlib.pyplot as plt
 
 def read_corpus(filename,tokenizer):
     seq = []
@@ -85,8 +86,9 @@ def attention(q, k, v, d_k, mask=None, dropout=None):
     scores = torch.matmul(q, k.transpose(-2, -1)) /  math.sqrt(d_k)
     
     if mask is not None:
-        mask = mask.unsqueeze(1)
-        scores = scores.masked_fill(mask == 0, -1e9)
+        # mask = mask.unsqueeze(1)
+        mask = mask.expand(q.size(0), q.size(1), -1, -1)
+        scores = scores.masked_fill(mask == 0, 1e-9)
     
     scores = F.softmax(scores, dim=-1)
     
@@ -124,7 +126,6 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1,2)
         q = q.transpose(1,2)
         v = v.transpose(1,2)
-        
 
         # calculate attention using function we will define next
         scores = attention(q, k, v, self.d_k, mask, self.dropout)
@@ -338,7 +339,7 @@ class WikiDataset(Dataset):
     def __init__(self, data, block_size):
         super(WikiDataset, self).__init__()
         self.block_size = block_size
-        self.data = [data[i:i+block_size] for i in range(0, len(data), block_size)]
+        self.data = [data[i:i+block_size+1] for i in range(0, len(data), block_size)]
 
     def __len__(self):
         return len(self.data)
@@ -363,6 +364,32 @@ def collate_fn(batch):
 def no_peak_mask(size):
     mask = torch.triu(torch.ones(size, size) * float('-inf'), diagonal=1)
     return mask
+
+import matplotlib.pyplot as plt
+
+def plot_metrics(training_losses, validation_losses, training_perplexities, validation_perplexities, filename='training_validation_metrics.png'):
+    plt.figure(figsize=(12, 6))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(training_losses, label='Training Loss')
+    plt.plot(validation_losses, label='Validation Loss')
+    plt.title('Loss over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(training_perplexities, label='Training Perplexity')
+    plt.plot(validation_perplexities, label='Validation Perplexity')
+    plt.title('Perplexity over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Perplexity')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()  # Close the figure to free up memory
+    print(f"Plot saved as {filename}")
 #############################
 
 def validate(model, valid_dataloader, loss_fn, device):
@@ -379,8 +406,9 @@ def validate(model, valid_dataloader, loss_fn, device):
     perplexity = math.exp(avg_loss)
     return avg_loss, perplexity
     
-def test(model, test_dataloader, loss_fn, device):
+def test(model, opt, test_dataloader, loss_fn):
     model.eval()
+    device = opt.device
     total_loss = 0
     with torch.no_grad():
         for input_text, target_text in test_dataloader:
@@ -394,7 +422,7 @@ def test(model, test_dataloader, loss_fn, device):
     return avg_loss, perplexity
 
     
-def train_model(model, opt, train_dataloader, valid_dataloader, optimizer, loss_fn, device):
+def train_model(model, opt, train_dataloader, valid_dataloader, loss_fn):
     
     print("training model...")
     # write code to:
@@ -409,11 +437,19 @@ def train_model(model, opt, train_dataloader, valid_dataloader, optimizer, loss_
     #  8. save model weights to file specified in opt.savenam
     #  SEE trainer.py for examples of each of the above
 
+    checkpoint_dir = os.path.join(opt.dir_name, 'checkpoints')
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
     # Lists for storing metrics
     train_losses = []
     valid_losses = []
     train_perplexities = []
     valid_perplexities = []
+
+    device = opt.device
+
+    optimizer = opt.optimizer
 
     for epoch in range(opt.epochs):
         model.train()
@@ -442,6 +478,11 @@ def train_model(model, opt, train_dataloader, valid_dataloader, optimizer, loss_
         print(f"Epoch {epoch}: Train Loss {avg_tl:.4f}, Train Perplexity {train_perplexity:.4f}")
         print(f"Epoch {epoch}: Valid Loss {avg_vl:.4f}, Valid Perplexity {valid_perplexity:.4f}")
 
+        if (epoch + 1) % 5 == 0:
+            model_save_path = os.path.join(checkpoint_dir, f'model_epoch_{epoch+1}.pth')
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Model saved to {model_save_path} at epoch {epoch+1}")
+
     return train_losses, train_perplexities, valid_losses, valid_perplexities
 
 
@@ -466,8 +507,8 @@ def main():
     parser.add_argument('-d_model', type=int, default=512)
     parser.add_argument('-n_layers', type=int, default=6)
     parser.add_argument('-heads', type=int, default=8)
-    parser.add_argument('-dropout', type=int, default=0.1)
-    parser.add_argument('-batchsize', type=int, default=1)
+    parser.add_argument('-dropout', type=float, default=0.1)
+    parser.add_argument('-batchsize', type=int, default=16)
     parser.add_argument('-printevery', type=int, default=100)
     parser.add_argument('-lr', type=int, default=0.00001)
     parser.add_argument('-seqlen', type=int, default=512)
@@ -513,9 +554,8 @@ def main():
     opt.indices = opt.indices.cuda()
     
     # Need a single vocab size
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = get_model(opt,opt.vocab_size)
-    model = model.to(device)
+    model = model.to(opt.device)
         
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     params = sum([np.prod(p.size()) for p in model_parameters])        
@@ -538,24 +578,28 @@ def main():
     # Code goes here
     # Train Dataloader
     train_dataset = WikiDataset(opt.train, block_size=opt.seqlen)
-    train_dataloader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=collate_fn)
+    train_dataloader = DataLoader(train_dataset, batch_size=opt.batchsize, shuffle=True, collate_fn=collate_fn)
 
     # Valid Dataloader
     valid_dataset = WikiDataset(opt.valid, block_size=opt.seqlen)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=collate_fn)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=opt.batchsize, shuffle=True, collate_fn=collate_fn)
 
     # Test Dataloader
     test_dataset = WikiDataset(opt.test, block_size=opt.seqlen)
-    test_dataloader = DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=True, collate_fn=collate_fn)
+    test_dataloader = DataLoader(test_dataset, batch_size=opt.batchsize, shuffle=True, collate_fn=collate_fn)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
             
     train_losses, train_perplexities, \
         valid_losses, valid_perplexities = train_model(model, opt, train_dataloader, \
-                                                       valid_dataloader, optimizer, loss_fn, device)
+                                                       valid_dataloader, loss_fn)
+    
+    # Plot the graphs
+    plot_metrics(train_losses, valid_losses, train_perplexities, valid_perplexities)
     # test_model(model,opt,-1)
-    avg_loss, perplexity = test(model, test_dataloader, loss_fn, device)
+    avg_loss, perplexity = test(model, opt, test_dataloader, loss_fn)
+    print(f"Test Loss {avg_loss:.4f}, Test Perplexity {perplexity:.4f}")
         
 if __name__ == "__main__":
     main()        
