@@ -467,6 +467,8 @@ def train_model(model, opt, train_dataloader, valid_dataloader, loss_fn):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if opt.SGDR == True:
+                opt.sched.step()
             
             total_tl += loss.item()
 

@@ -83,13 +83,13 @@ class Norm(nn.Module):
 
 def attention(q, k, v, d_k, mask=None, dropout=None):
     
-    # Change the dot product to euclidean distance metric
+    # Changed the dot product to euclidean distance metric
     # scores = torch.matmul(q, k.transpose(-2, -1)) /  math.sqrt(d_k)
     q_ex = q.unsqueeze(2)
     k_ex = k.unsqueeze(2)
 
     dist = torch.sum((q_ex - k_ex)**2, dim = -1)
-    # lower distances mean higher similarity
+    # -ve because lower distances mean higher similarity
     scores = -dist
     
     if mask is not None:
@@ -470,6 +470,8 @@ def train_model(model, opt, train_dataloader, valid_dataloader, loss_fn):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if opt.SGDR == True:
+                opt.sched.step()
             
             total_tl += loss.item()
 

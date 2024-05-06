@@ -1,3 +1,5 @@
+# b, s, s => mask
+
 import argparse
 import os
 import sys
@@ -12,6 +14,7 @@ import pickle
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from torch.autograd import Variable
 from torch.autograd import Variable
 from transformers import GPT2TokenizerFast
 from torch.utils.data import DataLoader, Dataset
@@ -392,7 +395,7 @@ def plot_metrics(training_losses, validation_losses, training_perplexities, vali
     print(f"Plot saved as {filename}")
 #############################
 
-def validate(model, valid_dataloader, loss_fn, device):
+def validate(model, valid_dataloader, device):
     model.eval()
     total_loss = 0
     with torch.no_grad():
@@ -400,13 +403,13 @@ def validate(model, valid_dataloader, loss_fn, device):
             input_text, target_text = input_text.to(device), target_text.to(device)
             input_mask = no_peak_mask(input_text.size(1)).to(device)
             output = model(input_text, input_mask)
-            loss = loss_fn(output.view(-1, output.size(-1)), target_text.view(-1))
+            loss = F.cross_entropy(output.view(-1, output.size(-1)), target_text.view(-1), ignore_index=-100)
             total_loss += loss.item()
     avg_loss = total_loss / len(valid_dataloader)
     perplexity = math.exp(avg_loss)
     return avg_loss, perplexity
     
-def test(model, opt, test_dataloader, loss_fn):
+def test(model, opt, test_dataloader):
     model.eval()
     device = opt.device
     total_loss = 0
@@ -415,14 +418,14 @@ def test(model, opt, test_dataloader, loss_fn):
             input_text, target_text = input_text.to(device), target_text.to(device)
             input_mask = no_peak_mask(input_text.size(1)).to(device)
             output = model(input_text, input_mask)
-            loss = loss_fn(output.view(-1, output.size(-1)), target_text.view(-1))
+            loss = F.cross_entropy(output.view(-1, output.size(-1)), target_text.view(-1), ignore_index=-100)
             total_loss += loss.item()
     avg_loss = total_loss / len(test_dataloader)
     perplexity = math.exp(avg_loss)
     return avg_loss, perplexity
 
     
-def train_model(model, opt, train_dataloader, valid_dataloader, loss_fn):
+def train_model(model, opt, train_dataloader, valid_dataloader):
     
     print("training model...")
     # write code to:
@@ -459,16 +462,18 @@ def train_model(model, opt, train_dataloader, valid_dataloader, loss_fn):
             input_text, target_text = input_text.to(device), target_text.to(device)
             input_mask = no_peak_mask(input_text.size(1)).to(device)
             output = model(input_text, input_mask)
-            loss = loss_fn(output.view(-1, output.size(-1)), target_text.view(-1))
+            loss = F.cross_entropy(output.view(-1, output.size(-1)), target_text.view(-1), ignore_index=-100)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if opt.SGDR == True:
+                opt.sched.step()
             
             total_tl += loss.item()
 
         avg_tl = total_tl / len(train_dataloader)
         train_perplexity = math.exp(avg_tl)
-        avg_vl, valid_perplexity = validate(model, valid_dataloader, loss_fn, device)
+        avg_vl, valid_perplexity = validate(model, valid_dataloader, device)
 
         train_losses.append(avg_tl)
         valid_losses.append(avg_vl)
@@ -484,8 +489,6 @@ def train_model(model, opt, train_dataloader, valid_dataloader, loss_fn):
             print(f"Model saved to {model_save_path} at epoch {epoch+1}")
 
     return train_losses, train_perplexities, valid_losses, valid_perplexities
-
-
 
     
 def test_model(model, opt, epoch):
@@ -578,27 +581,27 @@ def main():
     # Code goes here
     # Train Dataloader
     train_dataset = WikiDataset(opt.train, block_size=opt.seqlen)
-    train_dataloader = DataLoader(train_dataset, batch_size=opt.batchsize, shuffle=True, collate_fn=collate_fn)
+    train_dataloader = DataLoader(train_dataset, batch_size=opt.batchsize, shuffle=False, collate_fn=collate_fn)
 
     # Valid Dataloader
     valid_dataset = WikiDataset(opt.valid, block_size=opt.seqlen)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=opt.batchsize, shuffle=True, collate_fn=collate_fn)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=opt.batchsize, shuffle=False, collate_fn=collate_fn)
 
     # Test Dataloader
     test_dataset = WikiDataset(opt.test, block_size=opt.seqlen)
-    test_dataloader = DataLoader(test_dataset, batch_size=opt.batchsize, shuffle=True, collate_fn=collate_fn)
+    test_dataloader = DataLoader(test_dataset, batch_size=opt.batchsize, shuffle=False, collate_fn=collate_fn)
 
     # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    # loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
             
     train_losses, train_perplexities, \
         valid_losses, valid_perplexities = train_model(model, opt, train_dataloader, \
-                                                       valid_dataloader, loss_fn)
+                                                       valid_dataloader)
     
     # Plot the graphs
     plot_metrics(train_losses, valid_losses, train_perplexities, valid_perplexities)
     # test_model(model,opt,-1)
-    avg_loss, perplexity = test(model, opt, test_dataloader, loss_fn)
+    avg_loss, perplexity = test(model, opt, test_dataloader)
     print(f"Test Loss {avg_loss:.4f}, Test Perplexity {perplexity:.4f}")
         
 if __name__ == "__main__":
